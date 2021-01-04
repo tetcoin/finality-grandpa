@@ -17,9 +17,10 @@
 use std::{fmt::Debug, sync::Arc};
 
 use futures::{
-	channel::mpsc::UnboundedReceiver, future::FusedFuture, sink::Buffer, stream::Fuse, FutureExt,
+	channel::mpsc::UnboundedReceiver, future::FusedFuture, stream::Fuse, FutureExt, SinkExt,
 	Stream, StreamExt,
 };
+use log::{debug, trace};
 
 use super::Environment;
 use crate::{
@@ -87,7 +88,7 @@ where
 	env: Arc<E>,
 	voting: Voting,
 	incoming: Fuse<E::In>,
-	outgoing: Buffer<E::Out, Message<H, N>>,
+	outgoing: E::Out,
 	round: Round<E::Id, H, N, E::Signature>,
 	state: Option<State<E::Timer>>,
 	primary_block: Option<(H, N)>,
@@ -106,11 +107,102 @@ where
 		&mut self,
 		vote: SignedMessage<H, N, E::Signature, E::Id>,
 	) -> Result<(), E::Error> {
+		let SignedMessage {
+			message,
+			signature,
+			id,
+		} = vote;
+
+		if !self
+			.env
+			.is_equal_or_descendent_of(self.round.base().0, message.target().0.clone())
+		{
+			trace!(target: "afg",
+				"Ignoring message targeting {:?} lower than round base {:?}",
+				message.target(), self.round.base(),
+			);
+
+			return Ok(());
+		}
+
+		match message {
+			Message::Prevote(prevote) => {
+				let import_result = self
+					.round
+					.import_prevote(&*self.env, prevote, id, signature)?;
+
+				if let Some(equivocation) = import_result.equivocation {
+					self.env
+						.prevote_equivocation(self.round.number(), equivocation);
+				}
+			}
+			Message::Precommit(precommit) => {
+				let import_result = self
+					.round
+					.import_precommit(&*self.env, precommit, id, signature)?;
+
+				if let Some(equivocation) = import_result.equivocation {
+					self.env
+						.precommit_equivocation(self.round.number(), equivocation);
+				}
+			}
+			Message::PrimaryPropose(primary) => {
+				let primary_id = self.round.primary_voter().0.clone();
+
+				// note that id here refers to the party which has cast the vote
+				// and not the id of the party which has received the vote message.
+				if id == primary_id {
+					self.primary_block = Some((primary.target_hash, primary.target_number));
+				}
+			}
+		}
+
 		Ok(())
 	}
 
-	fn primary_propose(&mut self, last_round_state: &RoundState<H, N>) -> Result<bool, E::Error> {
-		Ok(true)
+	async fn primary_propose(
+		&mut self,
+		last_round_state: &RoundState<H, N>,
+	) -> Result<bool, E::Error> {
+		let maybe_estimate = last_round_state.estimate.clone();
+
+		match (maybe_estimate, self.voting.is_primary()) {
+			(Some(last_round_estimate), true) => {
+				let maybe_finalized = last_round_state.finalized.clone();
+
+				// Last round estimate has not been finalized.
+				let should_send_primary =
+					maybe_finalized.map_or(true, |f| last_round_estimate.1 > f.1);
+
+				if should_send_primary {
+					debug!(target: "afg", "Sending primary block hint for round {}", self.round.number());
+
+					let primary = PrimaryPropose {
+						target_hash: last_round_estimate.0,
+						target_number: last_round_estimate.1,
+					};
+
+					self.env.proposed(self.round.number(), primary.clone())?;
+					self.outgoing.send(Message::PrimaryPropose(primary)).await?;
+
+					return Ok(true);
+				} else {
+					debug!(target: "afg",
+						"Last round estimate has been finalized, not sending primary block hint for round {}",
+						self.round.number(),
+					);
+				}
+			}
+			(None, true) => {
+				debug!(target: "afg",
+					"Last round estimate does not exist, not sending primary block hint for round {}",
+					self.round.number(),
+				);
+			}
+			_ => {}
+		}
+
+		Ok(false)
 	}
 
 	fn prevote(
@@ -161,7 +253,7 @@ where
 					let prevote_timer_ready = handle_inputs!(prevote_timer);
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
-						let proposed = self.primary_propose(last_round_state)?;
+						let proposed = self.primary_propose(last_round_state).await?;
 						let prevoted = self.prevote(prevote_timer_ready, last_round_state)?;
 
 						if prevoted {
