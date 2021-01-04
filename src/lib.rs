@@ -36,18 +36,18 @@ extern crate std;
 
 pub mod round;
 pub mod vote_graph;
-pub mod voter_set;
 #[cfg(feature = "std")]
 pub mod voter;
+pub mod voter_set;
 
 mod bitfield;
 mod weights;
-#[cfg(feature = "std")]
-mod bridge_state;
+
 #[cfg(any(test))]
 mod testing;
 #[cfg(any(test, feature = "fuzz-helpers"))]
 pub mod fuzz_helpers;
+
 #[cfg(not(feature = "std"))]
 mod std {
 	pub use core::cmp;
@@ -502,16 +502,16 @@ pub fn validate_commit<H, N, S, I, C: Chain<H, N>>(
 #[cfg(feature = "std")]
 pub fn process_commit_validation_result<H, N>(
 	validation_result: CommitValidationResult<H, N>,
-	mut callback: voter::Callback<voter::CommitProcessingOutcome>,
+	// mut callback: voter::Callback<voter::CommitProcessingOutcome>,
 ) {
 	if validation_result.ghost.is_some() {
-		callback.run(
-			voter::CommitProcessingOutcome::Good(voter::GoodCommit::new())
-		)
+		// callback.run(
+		// 	voter::CommitProcessingOutcome::Good(voter::GoodCommit::new())
+		// )
 	} else {
-		callback.run(
-			voter::CommitProcessingOutcome::Bad(voter::BadCommit::from(validation_result))
-		)
+		// callback.run(
+		// 	voter::CommitProcessingOutcome::Bad(voter::BadCommit::from(validation_result))
+		// )
 	}
 }
 
