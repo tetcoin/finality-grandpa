@@ -245,7 +245,44 @@ where
 		precommit_timer_ready: bool,
 		last_round_state: &RoundState<H, N>,
 	) -> Result<bool, E::Error> {
-		Ok(true)
+		let last_round_estimate = last_round_state
+			.estimate
+			.clone()
+			.expect("Rounds only started when prior round completable; qed");
+
+		let should_precommit = {
+			// we wait for the last round's estimate to be equal to or
+			// the ancestor of the current round's p-Ghost before precommitting.
+			let last_round_estimate_lower_or_equal_to_prevote_ghost = self
+				.round
+				.state()
+				.prevote_ghost
+				.as_ref()
+				.map_or(false, |p_g| {
+					p_g == &last_round_estimate
+						|| self
+							.env
+							.is_equal_or_descendent_of(last_round_estimate.0, p_g.0.clone())
+				});
+
+			last_round_estimate_lower_or_equal_to_prevote_ghost
+				&& (precommit_timer_ready || self.round.completable())
+		};
+
+		if should_precommit && self.voting.is_active() {
+			debug!(target: "afg", "Casting precommit for round {}", self.round.number());
+
+			let precommit = self.construct_precommit();
+			self.round.set_precommitted_index();
+
+			self.env
+				.precommitted(self.round.number(), precommit.clone())?;
+			self.outgoing.send(Message::Precommit(precommit)).await?;
+
+			return Ok(true);
+		}
+
+		Ok(false)
 	}
 
 	// construct a prevote message based on local state.
@@ -341,6 +378,19 @@ where
 			target_hash: t.0,
 			target_number: t.1,
 		}))
+	}
+
+	// construct a precommit message based on local state.
+	fn construct_precommit(&self) -> Precommit<H, N> {
+		let t = match self.round.state().prevote_ghost {
+			Some(target) => target,
+			None => self.round.base(),
+		};
+
+		Precommit {
+			target_hash: t.0,
+			target_number: t.1,
+		}
 	}
 
 	pub async fn run(mut self) -> Result<(), E::Error> {
