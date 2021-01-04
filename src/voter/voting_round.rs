@@ -20,7 +20,7 @@ use futures::{
 	channel::mpsc::UnboundedReceiver, future::FusedFuture, stream::Fuse, FutureExt, SinkExt,
 	Stream, StreamExt,
 };
-use log::{debug, trace};
+use log::{debug, trace, warn};
 
 use super::Environment;
 use crate::{
@@ -77,6 +77,12 @@ impl Voting {
 			_ => false,
 		}
 	}
+}
+
+enum PrevoteResult {
+	Prevoted,
+	Skipped,
+	Failed,
 }
 
 /// Logic for a voter on a specific round.
@@ -205,20 +211,136 @@ where
 		Ok(false)
 	}
 
-	fn prevote(
+	async fn prevote(
 		&mut self,
 		prevote_timer_ready: bool,
 		last_round_state: &RoundState<H, N>,
-	) -> Result<bool, E::Error> {
-		Ok(true)
+	) -> Result<PrevoteResult, E::Error> {
+		let should_prevote = prevote_timer_ready || self.round.completable();
+
+		if should_prevote && self.voting.is_active() {
+			if let Some(prevote) = self.construct_prevote(last_round_state)? {
+				debug!(target: "afg", "Casting prevote for round {}", self.round.number());
+
+				self.round.set_prevoted_index();
+
+				self.env.prevoted(self.round.number(), prevote.clone())?;
+				self.outgoing.send(Message::Prevote(prevote)).await?;
+
+				return Ok(PrevoteResult::Prevoted);
+			} else {
+				// when we can't construct a prevote, we shouldn't
+				// precommit.
+				self.voting = Voting::No;
+
+				return Ok(PrevoteResult::Failed);
+			}
+		}
+
+		Ok(PrevoteResult::Skipped)
 	}
 
-	fn precommit(
+	async fn precommit(
 		&mut self,
 		precommit_timer_ready: bool,
 		last_round_state: &RoundState<H, N>,
 	) -> Result<bool, E::Error> {
 		Ok(true)
+	}
+
+	// construct a prevote message based on local state.
+	fn construct_prevote(
+		&self,
+		last_round_state: &RoundState<H, N>,
+	) -> Result<Option<Prevote<H, N>>, E::Error> {
+		let last_round_estimate = last_round_state
+			.estimate
+			.clone()
+			.expect("Rounds only started when prior round completable; qed");
+
+		let find_descendent_of = match self.primary_block {
+			None => {
+				// vote for best chain containing prior round-estimate.
+				last_round_estimate.0
+			}
+			Some(ref primary_block) => {
+				// we will vote for the best chain containing `p_hash` iff
+				// the last round's prevote-GHOST included that block and
+				// that block is a strict descendent of the last round-estimate that we are
+				// aware of.
+				let last_prevote_g = last_round_state
+					.prevote_ghost
+					.clone()
+					.expect("Rounds only started when prior round completable; qed");
+
+				// if the blocks are equal, we don't check ancestry.
+				if primary_block == &last_prevote_g {
+					primary_block.0.clone()
+				} else if primary_block.1 >= last_prevote_g.1 {
+					last_round_estimate.0
+				} else {
+					// from this point onwards, the number of the primary-broadcasted
+					// block is less than the last prevote-GHOST's number.
+					// if the primary block is in the ancestry of p-G we vote for the
+					// best chain containing it.
+					let &(ref p_hash, p_num) = primary_block;
+					match self
+						.env
+						.ancestry(last_round_estimate.0.clone(), last_prevote_g.0.clone())
+					{
+						Ok(ancestry) => {
+							let to_sub = p_num + N::one();
+
+							let offset: usize = if last_prevote_g.1 < to_sub {
+								0
+							} else {
+								(last_prevote_g.1 - to_sub).as_()
+							};
+
+							if ancestry.get(offset).map_or(false, |b| b == p_hash) {
+								p_hash.clone()
+							} else {
+								last_round_estimate.0
+							}
+						}
+						Err(crate::Error::NotDescendent) => {
+							// This is only possible in case of massive equivocation
+							warn!(target: "afg",
+								"Possible case of massive equivocation: \
+								last round prevote GHOST: {:?} is not a descendant of last round estimate: {:?}",
+								last_prevote_g, last_round_estimate,
+							);
+
+							last_round_estimate.0
+						}
+					}
+				}
+			}
+		};
+
+		let best_chain = self.env.best_chain_containing(find_descendent_of.clone());
+		debug_assert!(
+			best_chain.is_some(),
+			"Previously known block {:?} has disappeared from chain",
+			find_descendent_of
+		);
+
+		let t = if let Some(target) = best_chain {
+			target
+		} else {
+			// If this block is considered unknown, something has gone wrong.
+			// log and handle, but skip casting a vote.
+			warn!(target: "afg",
+				"Could not cast prevote: previously known block {:?} has disappeared",
+				find_descendent_of,
+			);
+			return Ok(None);
+		};
+
+		Ok(Some(Prevote {
+			target_hash: t.0,
+			target_number: t.1,
+		}))
 	}
 
 	pub async fn run(mut self) -> Result<(), E::Error> {
@@ -254,14 +376,24 @@ where
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
 						let proposed = self.primary_propose(last_round_state).await?;
-						let prevoted = self.prevote(prevote_timer_ready, last_round_state)?;
+						let prevote_result = self.prevote(prevote_timer_ready, last_round_state).await?;
 
-						if prevoted {
-							self.state = Some(State::Prevoted(precommit_timer));
-						} else if proposed {
-							self.state = Some(State::Proposed(prevote_timer, precommit_timer));
-						} else {
-							self.state = Some(State::Start(prevote_timer, precommit_timer));
+						match prevote_result {
+							PrevoteResult::Prevoted => {
+								self.state = Some(State::Prevoted(precommit_timer));
+							}
+							PrevoteResult::Skipped => {
+								if proposed {
+									self.state = Some(State::Proposed(prevote_timer, precommit_timer));
+								} else {
+									self.state = Some(State::Start(prevote_timer, precommit_timer));
+								}
+							}
+							PrevoteResult::Failed => {
+								// we failed to construct the prevote, so let's make sure we don't
+								// try to vote anymore in this round.
+								self.state = None;
+							}
 						}
 					} else {
 						self.state = Some(State::Start(prevote_timer, precommit_timer));
@@ -271,12 +403,18 @@ where
 					let prevote_timer_ready = handle_inputs!(prevote_timer);
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
-						let prevoted = self.prevote(prevote_timer_ready, last_round_state)?;
-
-						if prevoted {
-							self.state = Some(State::Prevoted(precommit_timer));
-						} else {
-							self.state = Some(State::Proposed(prevote_timer, precommit_timer));
+						match self.prevote(prevote_timer_ready, last_round_state).await? {
+							PrevoteResult::Prevoted => {
+								self.state = Some(State::Prevoted(precommit_timer));
+							}
+							PrevoteResult::Skipped => {
+								self.state = Some(State::Proposed(prevote_timer, precommit_timer));
+							}
+							PrevoteResult::Failed => {
+								// we failed to construct the prevote, so let's make sure we don't
+								// try to vote anymore in this round.
+								self.state = None;
+							}
 						}
 					} else {
 						self.state = Some(State::Proposed(prevote_timer, precommit_timer));
@@ -287,7 +425,7 @@ where
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
 						let precommitted =
-							self.precommit(precommit_timer_ready, last_round_state)?;
+							self.precommit(precommit_timer_ready, last_round_state).await?;
 
 						if precommitted {
 							self.state = Some(State::Precommitted);
