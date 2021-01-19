@@ -28,7 +28,7 @@ use crate::{
 	validate_commit,
 	weights::VoteWeight,
 	BlockNumberOps, Commit, HistoricalVotes, ImportResult, Message, Precommit, Prevote,
-	PrimaryPropose, SignedMessage, SignedPrecommit,
+	PrimaryPropose, SignedMessage, SignedPrecommit, VoterSet,
 };
 
 /// The state of a voting round.
@@ -105,10 +105,56 @@ where
 
 impl<H, N, E> VotingRound<H, N, E>
 where
-	H: Clone + Debug + Eq + Ord,
-	N: BlockNumberOps + Debug,
+	H: Clone + Debug + Eq + Ord + Send,
+	N: BlockNumberOps + Debug + Send,
 	E: Environment<H, N>,
 {
+	pub(super) fn new(
+		env: Arc<E>,
+		round_number: u64,
+		voters: VoterSet<E::Id>,
+		base: (H, N),
+		last_round_state: Option<RoundState<H, N>>,
+		last_round_state_updates: Option<UnboundedReceiver<RoundState<H, N>>>,
+	) -> VotingRound<H, N, E> {
+		let round_data = env.round_data(round_number);
+		let round_params = crate::round::RoundParams {
+			voters,
+			base,
+			round_number,
+		};
+
+		let round = Round::new(round_params);
+
+		let voting = if round_data.voter_id.as_ref() == Some(&round.primary_voter().0) {
+			Voting::Primary
+		} else if round_data
+			.voter_id
+			.as_ref()
+			.map_or(false, |id| round.voters().contains(id))
+		{
+			Voting::Yes
+		} else {
+			Voting::No
+		};
+
+		VotingRound {
+			env,
+			voting,
+			round,
+			incoming: round_data.incoming.fuse(),
+			outgoing: round_data.outgoing,
+			state: Some(State::Start(
+				round_data.prevote_timer,
+				round_data.precommit_timer,
+			)),
+			primary_block: None,
+			best_finalized: None,
+			last_round_state,
+			last_round_state_updates,
+		}
+	}
+
 	fn handle_vote(
 		&mut self,
 		vote: SignedMessage<H, N, E::Signature, E::Id>,
@@ -395,8 +441,8 @@ where
 
 	pub async fn run(mut self) -> Result<(), E::Error> {
 		let mut last_round_state_updates = match self.last_round_state_updates.take() {
-			Some(stream) => stream.boxed_local().fuse(),
-			None => futures::stream::pending().boxed_local().fuse(),
+			Some(stream) => stream.boxed().fuse(),
+			None => futures::stream::pending().boxed().fuse(),
 		};
 
 		let mut last_round_state = std::mem::take(&mut self.last_round_state);
@@ -426,7 +472,8 @@ where
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
 						let proposed = self.primary_propose(last_round_state).await?;
-						let prevote_result = self.prevote(prevote_timer_ready, last_round_state).await?;
+						let prevote_result =
+							self.prevote(prevote_timer_ready, last_round_state).await?;
 
 						match prevote_result {
 							PrevoteResult::Prevoted => {
@@ -434,7 +481,8 @@ where
 							}
 							PrevoteResult::Skipped => {
 								if proposed {
-									self.state = Some(State::Proposed(prevote_timer, precommit_timer));
+									self.state =
+										Some(State::Proposed(prevote_timer, precommit_timer));
 								} else {
 									self.state = Some(State::Start(prevote_timer, precommit_timer));
 								}
@@ -474,8 +522,9 @@ where
 					let precommit_timer_ready = handle_inputs!(precommit_timer);
 
 					if let Some(last_round_state) = last_round_state.as_ref() {
-						let precommitted =
-							self.precommit(precommit_timer_ready, last_round_state).await?;
+						let precommitted = self
+							.precommit(precommit_timer_ready, last_round_state)
+							.await?;
 
 						if precommitted {
 							self.state = Some(State::Precommitted);
@@ -497,6 +546,20 @@ where
 			}
 
 			if self.round.completable() {
+				// FIXME: check `notify` method
+				if let Some((hash, number)) = self.round.state().finalized {
+					self.env.finalize_block(
+						hash.clone(),
+						number,
+						self.round.number(),
+						Commit {
+							target_hash: hash,
+							target_number: number,
+							precommits: Vec::new(),
+						},
+					)?;
+				}
+
 				let last_round_estimate_finalized = match last_round_state {
 					Some(RoundState {
 						estimate: Some((_, last_round_estimate)),

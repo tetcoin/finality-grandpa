@@ -25,16 +25,34 @@
 //!  votes will not be pushed to the sink. The protocol state machine still
 //!  transitions state as if the votes had been pushed out.
 
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use futures::{future::FusedFuture, Future, Sink, Stream};
 
 use crate::{
-	BlockNumberOps, Chain, Equivocation, Message, Precommit, Prevote, PrimaryPropose, SignedMessage,
+	round::State as RoundState, BlockNumberOps, Chain, Commit, Equivocation, Message, Precommit,
+	Prevote, PrimaryPropose, SignedMessage, VoterSet,
 };
 
 mod past_rounds;
 mod voting_round;
+
+use voting_round::VotingRound;
+
+/// Data necessary to participate in a round.
+pub struct RoundData<Id, Timer, Input, Output> {
+	/// Local voter id (if any.)
+	pub voter_id: Option<Id>,
+	/// Timer before prevotes can be cast. This should be Start + 2T
+	/// where T is the gossip time estimate.
+	pub prevote_timer: Timer,
+	/// Timer before precommits can be cast. This should be Start + 4T
+	pub precommit_timer: Timer,
+	/// Incoming messages.
+	pub incoming: Input,
+	/// Outgoing messages.
+	pub outgoing: Output,
+}
 
 pub trait Environment<H: Eq, N>: Chain<H, N> {
 	type Id: Clone + Debug + Ord;
@@ -48,6 +66,8 @@ pub trait Environment<H: Eq, N>: Chain<H, N> {
 	type Timer: Future<Output = Result<(), Self::Error>> + FusedFuture + Unpin;
 
 	type Error: From<crate::Error>;
+
+	fn round_data(&self, round: u64) -> RoundData<Self::Id, Self::Timer, Self::In, Self::Out>;
 
 	/// Note that an equivocation in prevotes has occurred.
 	fn prevote_equivocation(
@@ -97,4 +117,160 @@ pub trait Environment<H: Eq, N>: Chain<H, N> {
 	// 	base: (H, N),
 	// 	votes: &HistoricalVotes<H, N, Self::Signature, Self::Id>,
 	// ) -> Result<(), Self::Error>;
+
+	fn finalize_block(
+		&self,
+		hash: H,
+		number: N,
+		round: u64,
+		commit: Commit<H, N, Self::Signature, Self::Id>,
+	) -> Result<(), Self::Error>;
+}
+
+struct Voter<H, N, E>
+where
+	H: Ord,
+	E: Environment<H, N>,
+{
+	env: Arc<E>,
+	voters: VoterSet<E::Id>,
+	best_round: VotingRound<H, N, E>,
+}
+
+impl<H, N, E> Voter<H, N, E>
+where
+	H: Clone + Debug + Eq + Ord + Send,
+	N: BlockNumberOps + Debug + Send,
+	E: Environment<H, N>,
+{
+	pub fn new(
+		env: Arc<E>,
+		voters: VoterSet<E::Id>,
+		last_round_number: u64,
+		last_round_votes: Vec<SignedMessage<H, N, E::Signature, E::Id>>,
+		last_round_base: (H, N),
+		last_finalized: (H, N),
+	) -> Self {
+		let best_round = VotingRound::new(
+			env.clone(),
+			last_round_number + 1,
+			voters.clone(),
+			last_finalized,
+			Some(RoundState::genesis(last_round_base)),
+			None,
+		);
+
+		Voter {
+			env,
+			voters,
+			best_round,
+		}
+	}
+
+	pub async fn run(self) -> Result<(), E::Error> {
+		self.best_round.run().await
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::testing::{
+		self,
+		chain::GENESIS_HASH,
+		environment::{Environment, Id, Signature},
+	};
+	use futures::{executor::LocalPool, prelude::*, task::SpawnExt};
+
+	#[test]
+	fn talking_to_myself() {
+		let _ = env_logger::try_init();
+
+		let local_id = Id(5);
+		let voters = VoterSet::new(std::iter::once((local_id, 100))).unwrap();
+
+		let (network, routing_task) = testing::environment::make_network();
+
+		// let global_comms = network.make_global_comms();
+		let env = Arc::new(Environment::new(network, local_id));
+
+		// initialize chain
+		let last_finalized = env.with_chain(|chain| {
+			chain.push_blocks(GENESIS_HASH, &["A", "B", "C", "D", "E"]);
+			chain.last_finalized()
+		});
+
+		// run voter in background. scheduling it to shut down at the end.
+		let finalized = env.finalized_stream();
+		let voter = Voter::new(
+			env.clone(),
+			voters,
+			0,
+			Vec::new(),
+			last_finalized,
+			last_finalized,
+		);
+
+		let mut pool = LocalPool::new();
+		pool.spawner()
+			.spawn(voter.run().map(|v| v.expect("Error voting")))
+			.unwrap();
+
+		pool.spawner().spawn(routing_task).unwrap();
+
+		// wait for the best block to finalize.
+		pool.run_until(
+			finalized
+				.take_while(|&(_, n, _)| future::ready(n < 6))
+				.for_each(|_| future::ready(())),
+		)
+	}
+
+	#[test]
+	fn finalizing_at_fault_threshold() {
+		let _ = env_logger::try_init();
+
+		// 10 voters
+		let voters = VoterSet::new((0..10).map(|i| (Id(i), 1))).expect("nonempty");
+
+		let (network, routing_task) = testing::environment::make_network();
+		let mut pool = LocalPool::new();
+
+		// 3 voters offline.
+		let finalized_streams = (0..7)
+			.map(|i| {
+				let local_id = Id(i);
+				// initialize chain
+				let env = Arc::new(Environment::new(network.clone(), local_id));
+				let last_finalized = env.with_chain(|chain| {
+					chain.push_blocks(GENESIS_HASH, &["A", "B", "C", "D", "E"]);
+					chain.last_finalized()
+				});
+
+				// run voter in background. scheduling it to shut down at the end.
+				let finalized = env.finalized_stream();
+				let voter = Voter::new(
+					env.clone(),
+					voters.clone(),
+					0,
+					Vec::new(),
+					last_finalized,
+					last_finalized,
+				);
+
+				pool.spawner()
+					.spawn(voter.run().map(|v| v.expect("Error voting")))
+					.unwrap();
+
+				// wait for the best block to be finalized by all honest voters
+				finalized
+					.take_while(|&(_, n, _)| future::ready(n < 6))
+					.for_each(|_| future::ready(()))
+			})
+			.collect::<Vec<_>>();
+
+		pool.spawner().spawn(routing_task.map(|_| ())).unwrap();
+
+		pool.run_until(future::join_all(finalized_streams.into_iter()));
+	}
 }
