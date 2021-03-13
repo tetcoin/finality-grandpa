@@ -1,4 +1,4 @@
-# `finality-grandpa`
+# `tetsy-finality-grandpa`
 
 [![crates.io link][crates-badge]][crates] [![Build Status][travis-badge]][travis] [![Code coverage][codecov-badge]][codecov]
 
