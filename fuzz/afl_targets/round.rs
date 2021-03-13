@@ -15,7 +15,7 @@
 #[macro_use]
 extern crate afl;
 
-use finality_grandpa::fuzz_helpers;
+use tetsy_finality_grandpa::fuzz_helpers;
 
 fn main() {
 	fuzz!(|data: &[u8]| {

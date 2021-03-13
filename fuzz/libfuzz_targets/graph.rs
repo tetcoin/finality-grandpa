@@ -15,7 +15,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-use finality_grandpa::fuzz_helpers;
+use tetsy_finality_grandpa::fuzz_helpers;
 
 fuzz_target!(|data: &[u8]| {
     fuzz_helpers::execute_fuzzed_graph(data)

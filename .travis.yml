@@ -48,7 +48,7 @@ jobs:
       sudo make install
       cd ../..
       rm -rf kcov-master
-      crate="finality_grandpa"
+      crate="tetsy_finality_grandpa"
       for file in target/debug/$crate-*[^\.d]; do
         mkdir -p "target/cov/$(basename $file)"
         kcov --exclude-pattern=/.cargo,/usr/lib --verify "target/cov/$(basename $file)" "$file"
