@@ -269,7 +269,7 @@ impl<H, N, E: Environment<H, N>> PastRounds<H, N, E> where
 		let background = BackgroundRound {
 			inner: round,
 			waker: None,
-			// https://github.com/paritytech/finality-grandpa/issues/50
+			// https://github.com/tetcoin/tetsy-finality-grandpa/issues/50
 			finalized_number: N::zero(),
 			round_committer: Some(RoundCommitter::new(
 				env.round_commit_timer(),

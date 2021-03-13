@@ -19,7 +19,7 @@ mod context;
 use context::{Context, VoteNode, Vote};
 
 #[cfg(feature = "derive-codec")]
-use parity_scale_codec::{Encode, Decode};
+use tetsy_scale_codec::{Encode, Decode};
 
 use crate::std::{
 	self,

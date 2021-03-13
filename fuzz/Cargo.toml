@@ -1,6 +1,6 @@
 
 [package]
-name = "finality-grandpa-fuzz"
+name = "tetsy-finality-grandpa-fuzz"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
@@ -11,7 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 afl = { version = "0.8", features = ["reset_lazy_static"], optional = true }
-finality-grandpa = { path = "..", features = ["fuzz-helpers"] }
+tetsy-finality-grandpa = { path = "..", features = ["fuzz-helpers"] }
 libfuzzer-sys = "0.3"
 
 # Prevent this from interfering with workspaces

@@ -77,7 +77,7 @@ mod std {
 use crate::std::vec::Vec;
 use crate::voter_set::VoterSet;
 #[cfg(feature = "derive-codec")]
-use parity_scale_codec::{Encode, Decode};
+use tetsy_scale_codec::{Encode, Decode};
 use round::ImportResult;
 
 /// A prevote for a block and its ancestors.
@@ -588,7 +588,7 @@ mod tests {
 	#[cfg(feature = "derive-codec")]
 	#[test]
 	fn codec_was_derived() {
-		use parity_scale_codec::{Encode, Decode};
+		use tetsy_scale_codec::{Encode, Decode};
 
 		let signed = crate::SignedMessage {
 			message: crate::Message::Prevote(crate::Prevote {
